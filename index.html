@@ -163,7 +163,11 @@ button { font: inherit; color: inherit; cursor: pointer; }
 .myrank { font-family: var(--f-impact); font-size: 18px; color: var(--sky); text-align: center; }
 .nickrow { display: flex; gap: 6px; width: 100%; }
 .nickrow input { flex: 1; min-width: 0; font: inherit; font-size: 14px; padding: 6px 10px; border: 2px solid var(--ink); border-radius: 8px; background: #FFFDF6; color: var(--ink); }
-.nickrow button { background: var(--ink); color: var(--paper); border: none; border-radius: 8px; padding: 6px 12px; font-size: 13px; }
+.nickrow input { -webkit-user-select: text; user-select: text; }
+.nickrow button { background: var(--ink); color: var(--paper); border: none; border-radius: 8px; padding: 6px 12px; font-size: 13px; min-width: 76px; touch-action: manipulation; }
+.nickrow button:disabled { opacity: .55; }
+.nickmsg { font-size: 12px; margin: -2px 0 0; text-align: center; min-height: 1em; color: var(--sky); }
+.nickmsg.bad { color: var(--rose); }
 .go.sub { background: var(--paper); color: var(--ink); font-size: 15px; padding: 8px 20px; }
 .row2 { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; }
 
@@ -239,7 +243,8 @@ button { font: inherit; color: inherit; cursor: pointer; }
     </div>
     <div class="rankbox">
       <div class="myrank" id="myRank"></div>
-      <div class="nickrow" id="nickRowEnd"><input id="nickEnd" maxlength="12" placeholder="랭킹에 표시할 이름 (선택)" aria-label="랭킹 이름"><button id="nickEndSave">이름 저장</button></div>
+      <div class="nickrow" id="nickRowEnd"><input id="nickEnd" maxlength="12" placeholder="랭킹에 표시할 이름 (선택)" aria-label="랭킹 이름"><button id="nickEndSave" type="button">이름 저장</button></div>
+      <p class="nickmsg" id="nickEndMsg" aria-live="polite"></p>
       <ol class="rlist" id="rankEnd"></ol><p class="note" id="rankEndNote"></p>
     </div>
     <div class="row2"><button class="go" id="bAgain">한 판 더</button><button class="go sub" id="bRankEnd">전체 랭킹</button></div>
@@ -253,7 +258,8 @@ button { font: inherit; color: inherit; cursor: pointer; }
     <p class="shout">"누가 제일 많이 때렸는지 다 적어 둘 거야!"</p>
     <div class="rankbox">
       <div class="myrank" id="myRankPanel"></div>
-      <div class="nickrow" id="nickRowPanel"><input id="nickPanel" maxlength="12" placeholder="랭킹에 표시할 이름 (선택)" aria-label="랭킹 이름"><button id="nickPanelSave">이름 저장</button></div>
+      <div class="nickrow" id="nickRowPanel"><input id="nickPanel" maxlength="12" placeholder="랭킹에 표시할 이름 (선택)" aria-label="랭킹 이름"><button id="nickPanelSave" type="button">이름 저장</button></div>
+      <p class="nickmsg" id="nickPanelMsg" aria-live="polite"></p>
       <ol class="rlist scroll" id="rankPanel"></ol><p class="note" id="rankPanelNote"></p>
     </div>
     <button class="go" id="bRankClose">닫기</button>
@@ -718,8 +724,8 @@ async function initRank() {
   const c = window.claude;
   if (!c || typeof c.use !== "function") {
     Rank.mode = "http"; Rank.me = Http.ids(); Rank.canWrite = true; Rank.state = "loading";
-    renderRank(); await Http.load();
-    Http.timer = setInterval(() => { if (!document.hidden && !(state?.running && !state.paused)) Http.load(); }, 30000);
+    renderRank(); await Http.load(); await flushPending();
+    Http.timer = setInterval(async () => { if (!document.hidden && !(state?.running && !state.paused)) { await Http.load(); await flushPending(); } }, 30000);
     return;
   }
   const [db, user] = await Promise.all([c.use("db"), c.use("user")]);
@@ -738,16 +744,38 @@ async function initRank() {
   }, () => { clearTimeout(timer); Rank.state = "error"; renderRank(); });
 }
 
+/* 올리지 못한 기록은 브라우저에 보관했다가 다음 접속·이름 저장 때 다시 올린다 */
+const Pending = {
+  get() { try { return JSON.parse(localStorage.getItem("tantrum.whack.pending") || "null"); } catch { return Rank.pendingMem || null; } },
+  set(p) { Rank.pendingMem = p; try { p ? localStorage.setItem("tantrum.whack.pending", JSON.stringify(p)) : localStorage.removeItem("tantrum.whack.pending"); } catch {} }
+};
+async function httpSubmit(rec) {
+  try {
+    const j = await Http.post({ best: rec.best, combo: rec.combo, nick: cleanNick(Rank.nick), durationMs: rec.durationMs });
+    Rank.mine = { id: Rank.me, best: j.best || rec.best, combo: rec.combo, nick: cleanNick(Rank.nick) };
+    Pending.set(null); Rank.lastError = null;
+    await Http.load();
+    return "saved";
+  } catch (e) {
+    Rank.lastError = e.code || "network";
+    if (e.code === "bad_score" || e.code === "implausible" || e.code === "not_owner") { Pending.set(null); return "failed"; }
+    const old = Pending.get();
+    if (!old || rec.best > old.best) Pending.set(rec);
+    return "failed";
+  }
+}
+async function flushPending() {
+  const p = Pending.get();
+  if (!p || Rank.mode !== "http" || Rank.state !== "ok") return;
+  if (p.best <= (Rank.mine?.best || 0)) return Pending.set(null);
+  await httpSubmit(p);
+}
+
 async function submitScore(hits, combo) {
   if (Rank.mode === "http") {
     if (Rank.state === "notReady") return "off";
     if (hits <= (Rank.mine?.best || 0)) return hits === 0 ? "zero" : "notBest";
-    try {
-      const j = await Http.post({ best: hits, combo, nick: cleanNick(Rank.nick), durationMs: Math.round(performance.now() - (state.startedAt || 0)) });
-      Rank.mine = { id: Rank.me, best: j.best || hits, combo, nick: cleanNick(Rank.nick) };
-      await Http.load();
-      return "saved";
-    } catch { return "failed"; }
+    return httpSubmit({ best: hits, combo, durationMs: Math.round(performance.now() - (state.startedAt || 0)) });
   }
   if (!Rank.db || !Rank.me) return "off";
   if (Rank.canWrite === false) return "readonly";
@@ -765,19 +793,50 @@ async function submitScore(hits, combo) {
   }
 }
 
+const ERR_TEXT = {
+  rate_limited: "요청이 너무 많아요. 잠깐 뒤에 다시 눌러 주세요.",
+  not_owner: "이 기록은 다른 브라우저에서 만든 거라 여기서 바꿀 수 없어요.",
+  storage_not_configured: "랭킹 서버를 준비 중이에요.",
+  network: "인터넷 연결을 확인하고 다시 눌러 주세요."
+};
+const errText = code => ERR_TEXT[code] || "저장하지 못했어요. 잠깐 뒤에 다시 눌러 주세요.";
+
 async function saveNick(inputId) {
+  const btn = $(inputId + "Save"), msg = $(inputId + "Msg");
+  const say = (t, bad) => { msg.textContent = t; msg.classList.toggle("bad", !!bad); };
   const v = cleanNick($(inputId).value);
+  $(inputId).value = v;
+  if (!v) return say("이름을 입력해 주세요.", true);
+  btn.disabled = true; btn.textContent = "저장 중…"; say("");
   Rank.nick = v;
   try { localStorage.setItem("tantrum.whack.nick", v); } catch {}
-  if (Rank.mode === "http") {
-    if (Rank.mine && v !== Rank.mine.nick) { try { await Http.post({ action: "nick", nick: v }); Rank.mine.nick = v; await Http.load(); } catch {} }
-    return renderRank();
+  try {
+    if (Rank.mode === "http") {
+      if (Pending.get()) await flushPending();            // 못 올린 기록이 있으면 이름과 함께 먼저 올린다
+      else Rank.lastError = null;
+      if (!Rank.mine) {
+        try { await Http.post({ action: "nick", nick: v }); } catch {}
+        say(Rank.lastError ? errText(Rank.lastError) + " 이름은 다음 기록과 함께 올라가요." : "저장했어요. 다음 판 기록부터 이 이름으로 올라가요.", !!Rank.lastError);
+      } else if (v === Rank.mine.nick) {
+        say("저장했어요 ✓");
+      } else {
+        await Http.post({ action: "nick", nick: v });
+        Rank.mine.nick = v; await Http.load();
+        say("랭킹 이름을 바꿨어요 ✓");
+      }
+    } else if (Rank.mine && Rank.db && Rank.me && Rank.canWrite !== false) {
+      if (v !== Rank.mine.nick) { await Rank.db.doc("scores/" + Rank.me).update({ nick: v }); Rank.mine.nick = v; }
+      say("랭킹 이름을 바꿨어요 ✓");
+    } else {
+      say("저장했어요. 다음 판 기록부터 이 이름으로 올라가요.");
+    }
+  } catch (e) {
+    if (Rank.mode !== "http" && e?.code === "invalid_argument") Rank.canWrite = false;
+    say(errText(e?.code), true);
+  } finally {
+    btn.disabled = false; btn.textContent = "이름 저장";
+    renderRank();
   }
-  if (Rank.mine && Rank.db && Rank.me && Rank.canWrite !== false && v !== Rank.mine.nick) {
-    try { await Rank.db.doc("scores/" + Rank.me).update({ nick: v }); Rank.mine.nick = v; }
-    catch (e) { if (e?.code === "invalid_argument") Rank.canWrite = false; }
-  }
-  renderRank();
 }
 
 const myPlace = () => {
@@ -827,7 +886,7 @@ async function renderRank() {
   const msg = !lr ? "" : lr.status === "pending" ? "기록을 올리는 중…"
     : lr.status === "saved" ? `신기록! 랭킹 ${place ? (typeof place === "number" ? place + "위" : place) : "등록"}`
     : lr.status === "notBest" ? `내 최고 기록은 ${Rank.mine.best.toLocaleString("ko-KR")}타` + (place ? ` · ${typeof place === "number" ? place + "위" : place}` : "")
-    : lr.status === "failed" ? "기록을 올리지 못했어요. 다음 판에 다시 시도해요." : "";
+    : lr.status === "failed" ? `기록을 올리지 못했어요. ${errText(Rank.lastError)}` + (Pending.get() ? " 기록은 보관해 두었다가 다시 올려요." : "") : "";
   $("myRank").textContent = msg;
   const canNick = Rank.state !== "off" && !!Rank.me && Rank.canWrite !== false;
   $("nickRowEnd").hidden = !canNick; $("nickRowPanel").hidden = !canNick;
@@ -885,7 +944,10 @@ $("bRankEnd").onclick = () => { $("endOv").hidden = true; openRank(); Rank.fromE
 $("bRankClose").onclick = () => { $("rankOv").hidden = true; if (Rank.fromEnd) { Rank.fromEnd = false; $("endOv").hidden = false; } };
 $("nickEndSave").onclick = () => saveNick("nickEnd");
 $("nickPanelSave").onclick = () => saveNick("nickPanel");
-["nickEnd", "nickPanel"].forEach(id => $(id).addEventListener("keydown", e => { e.stopPropagation(); if (e.key === "Enter") saveNick(id); }));
+["nickEnd", "nickPanel"].forEach(id => $(id).addEventListener("keydown", e => {
+  e.stopPropagation();
+  if (e.key === "Enter" && !e.isComposing && e.keyCode !== 229) saveNick(id);   // 한글 조합 중 Enter는 무시
+}));
 renderRank();
 initRank();
 document.addEventListener("visibilitychange", () => { if (document.hidden && state?.running && !state.paused) pause(true); });
