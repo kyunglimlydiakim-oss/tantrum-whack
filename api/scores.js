@@ -20,7 +20,8 @@ const LIMIT = 50;
 const NICK_MAX = 12;
 const MAX_HITS = 100000;
 const HITS_PER_SEC = 8;          // 가장 빠른 단계에서도 넘기 어려운 속도
-const POSTS_PER_MIN = 20;
+const POSTS_PER_MIN_PLAYER = 15;  // 플레이어 한 명당
+const POSTS_PER_MIN_IP = 300;     // 회사처럼 여러 명이 같은 IP를 쓰는 경우를 위해 넉넉하게
 
 const ID_RE = /^[A-Za-z0-9-]{8,64}$/;
 
@@ -69,11 +70,11 @@ module.exports = async function handler(req, res) {
     const b = typeof req.body === "string" ? JSON.parse(req.body || "{}") : (req.body || {});
     if (!ID_RE.test(String(b.id)) || !ID_RE.test(String(b.secret))) return res.status(400).json({ error: "bad_player" });
 
-    // 요청 속도 제한 (IP당 1분)
+    // 요청 속도 제한 (1분 창): 플레이어별로 좁게, IP별로는 넓게
     const ip = String(req.headers["x-forwarded-for"] || "").split(",")[0].trim() || "unknown";
-    const [count] = await redis([["INCR", "tw:rl:" + sha(ip).slice(0, 24)]]);
-    if (count === 1) await redis([["EXPIRE", "tw:rl:" + sha(ip).slice(0, 24), "60"]]);
-    if (count > POSTS_PER_MIN) return res.status(429).json({ error: "rate_limited" });
+    const kPlayer = "tw:rl:p:" + b.id, kIp = "tw:rl:ip:" + sha(ip).slice(0, 24);
+    const [, , nPlayer, nIp] = await redis([["SET", kPlayer, "0", "EX", "60", "NX"], ["SET", kIp, "0", "EX", "60", "NX"], ["INCR", kPlayer], ["INCR", kIp]]);
+    if (nPlayer > POSTS_PER_MIN_PLAYER || nIp > POSTS_PER_MIN_IP) return res.status(429).json({ error: "rate_limited" });
 
     // 이 id의 주인 확인: 처음이면 secret 해시를 등록, 아니면 일치해야 한다
     const hash = sha(b.secret);
@@ -99,6 +100,7 @@ module.exports = async function handler(req, res) {
     const rank = out[out.length - 1], score = out[out.length - 2];
     return res.status(200).json({ ok: true, best: toInt(score), rank: rank == null ? null : rank + 1 });
   } catch (e) {
+    console.error("scores api error:", e && e.message);   // Vercel 로그에서 원인 확인용
     return res.status(500).json({ error: "server_error" });
   }
 };
